@@ -57,20 +57,27 @@ def synthesize_tts_bytes(text: str) -> bytes:
 
 
 @dataclass
+class QueueItem:
+    user_id: int
+    user_name: str
+    text: str
+
+
+@dataclass
 class GuildTTSState:
-    owner_id: Optional[int] = None
     channel_id: Optional[int] = None
     last_active: float = 0.0
     idle_task: Optional[asyncio.Task] = None
-    queue: asyncio.Queue = field(default_factory=asyncio.Queue)
+    queue: asyncio.Queue[QueueItem] = field(default_factory=asyncio.Queue)
     player_task: Optional[asyncio.Task] = None
+    is_speaking: bool = False
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def reset_state(self):
         current = asyncio.current_task()
-        self.owner_id = None
         self.channel_id = None
         self.last_active = 0.0
+        self.is_speaking = False
         if self.idle_task and not self.idle_task.done() and self.idle_task is not current:
             self.idle_task.cancel()
         self.idle_task = None
@@ -158,7 +165,7 @@ async def wait_for_voice_ready(vc: discord.VoiceClient, timeout: float = 5.0):
 
 
 async def start_or_reset_idle_timer(guild: discord.Guild, state: GuildTTSState):
-    """ตั้งเวลา (หรือรีเซ็ตเวลา) Idle 15 นาที เมื่อครบกำหนดจะออกจากห้องเอง"""
+    """ตั้งเวลา (หรือรีเซ็ตเวลา) Idle 15 นาทีของห้อง เมื่อครบกำหนดบอทจะออกจากห้องเอง"""
     state.last_active = time.monotonic()
     if state.idle_task and not state.idle_task.done():
         state.idle_task.cancel()
@@ -173,8 +180,8 @@ async def start_or_reset_idle_timer(guild: discord.Guild, state: GuildTTSState):
                 await asyncio.sleep(remaining)
 
             vc = guild.voice_client
-            if vc and vc.is_playing():
-                while vc.is_playing():
+            if vc and (vc.is_playing() or not state.queue.empty()):
+                while vc.is_playing() or not state.queue.empty():
                     await asyncio.sleep(1)
 
             state.reset_state()
@@ -187,11 +194,12 @@ async def start_or_reset_idle_timer(guild: discord.Guild, state: GuildTTSState):
 
 
 async def audio_player_worker(guild: discord.Guild, state: GuildTTSState):
-    """ดึงข้อความจากคิวมาแปลงเป็นเสียงและพูดทีละประโยค"""
+    """ดึงข้อความจากคิวมาแปลงเป็นเสียงและพูดเรียงตามคิวทีละประโยค"""
     try:
         while True:
-            text = await state.queue.get()
+            item: QueueItem = await state.queue.get()
             tmp_path = None
+            state.is_speaking = True
             try:
                 vc = guild.voice_client
                 if not vc or not vc.is_connected():
@@ -199,7 +207,7 @@ async def audio_player_worker(guild: discord.Guild, state: GuildTTSState):
 
                 await wait_for_voice_ready(vc)
 
-                audio_bytes = await asyncio.to_thread(synthesize_tts_bytes, text)
+                audio_bytes = await asyncio.to_thread(synthesize_tts_bytes, item.text)
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_file:
                     tmp_file.write(audio_bytes)
@@ -225,6 +233,7 @@ async def audio_player_worker(guild: discord.Guild, state: GuildTTSState):
             except Exception as e:
                 print(f"[Player Exception] {e}", flush=True)
             finally:
+                state.is_speaking = False
                 if tmp_path and os.path.exists(tmp_path):
                     try:
                         os.remove(tmp_path)
@@ -232,7 +241,7 @@ async def audio_player_worker(guild: discord.Guild, state: GuildTTSState):
                         pass
                 state.queue.task_done()
     except asyncio.CancelledError:
-        pass
+        state.is_speaking = False
 
 
 async def handle_tts_request(
@@ -241,8 +250,9 @@ async def handle_tts_request(
     text: str,
 ) -> tuple[bool, str]:
     """
-    ตรวจสอบสิทธิ์แบบ 1:1 และจัดการเข้าห้อง/พูดข้อความ
-    คืนค่า (สำเร็จหรือไม่, ข้อความตอบกลับ)
+    ตรวจสอบสิทธิ์แบบล็อกรายห้องเสียง (Per-Channel Lock) พร้อมระบบคิวข้อความ (Message Queue):
+    - คนในห้องเสียงเดียวกันกับบอทสามารถพิมพ์สั่งพูดต่อคิวกันได้ทุกคนโดยไม่ต้องเตะบอท
+    - คนที่อยู่คนละห้องเสียงจะไม่สามารถดึงบอทข้ามห้องได้ จนกว่าบอทจะถูกเตะ (Disconnect) หรือห้องเดิม Idle ครบ 15 นาที
     """
     text = text.strip()
     if not text:
@@ -251,71 +261,66 @@ async def handle_tts_request(
     if len(text) > 500:
         return False, "❌ ข้อความยาวเกินไป (สูงสุด 500 ตัวอักษร)"
 
+    # ผู้เรียกต้องอยู่ในห้องเสียง
+    if not user.voice or not user.voice.channel:
+        return False, "❌ คุณต้องอยู่ในห้องเสียง (Voice Channel) ก่อนเรียกใช้งานบอท"
+
+    target_channel = user.voice.channel
     state = bot.get_state(guild.id)
 
     async with state.lock:
         vc = guild.voice_client
 
         # กรณีบอทหลุดจากห้องไปแล้วแต่สถานะยังค้างอยู่ ให้ล้างสถานะก่อน
-        if vc is None or not vc.is_connected():
+        if vc is None or not vc.is_connected() or vc.channel is None:
             state.reset_state()
             vc = None
+        else:
+            # ซิงก์ channel_id ให้ตรงกับห้องปัจจุบันที่บอทอยู่จริง (เผื่อแอดมินลากบอทย้ายห้อง)
+            state.channel_id = vc.channel.id
 
-        # ตรวจสอบว่ามีคนอื่นถือสิทธิ์ 1:1 อยู่หรือไม่
-        if state.owner_id is not None and state.owner_id != user.id:
+        # ตรวจสอบว่าบอทกำลังติดล็อกประจำอยู่ห้องเสียงอื่นหรือไม่
+        if state.channel_id is not None and state.channel_id != target_channel.id:
             elapsed = time.monotonic() - state.last_active
             remaining_sec = max(0, int(IDLE_TIMEOUT - elapsed))
             mins, secs = divmod(remaining_sec, 60)
             return (
                 False,
-                f"🔒 ขณะนี้บอทกำลังใช้งานแบบ 1:1 อยู่กับ <@{state.owner_id}> "
-                f"(จะว่างเมื่อบอทถูกเตะออกจากห้อง หรือไม่มีการใช้งานครบ 15 นาที — เหลือเวลาประมาณ {mins} นาที {secs} วินาที)",
+                f"🔒 ขณะนี้บอทกำลังประจำอยู่ที่ห้อง <#{state.channel_id}> "
+                f"(คนในห้องนั้นสั่งพูดต่อคิวกันได้เลย แต่จะย้ายมาห้องคุณได้เมื่อบอทถูก Disconnect หรือไม่มีคนใช้งานครบ 15 นาที — เหลือเวลาประมาณ {mins} นาที {secs} วินาที)",
             )
 
-        # ผู้เรียกต้องอยู่ในห้องเสียง
-        if not user.voice or not user.voice.channel:
-            return False, "❌ คุณต้องอยู่ในห้องเสียง (Voice Channel) ก่อนเรียกใช้งานบอท"
-
-        target_channel = user.voice.channel
-
-        # กรณีเริ่มต้นใช้งานใหม่ (ยังไม่มีเจ้าของ)
-        if state.owner_id is None:
+        # กรณีบอทยังไม่ได้อยู่ในห้องเสียง ให้เชื่อมต่อเข้าห้องของผู้เรียกและล็อกห้องนั้น
+        if vc is None:
             try:
-                if vc is None:
-                    vc = await target_channel.connect(self_deaf=False, self_mute=False)
-                elif vc.channel.id != target_channel.id:
-                    await vc.move_to(target_channel)
+                vc = await target_channel.connect(self_deaf=False, self_mute=False)
             except Exception as e:
                 return False, f"❌ ไม่สามารถเข้าห้องเสียงได้: {e}"
-
-            state.owner_id = user.id
             state.channel_id = target_channel.id
-        else:
-            # กรณีเจ้าของเดิมสั่งซ้ำ: หากเจ้าของย้ายห้อง บอทจะตามไปหาเจ้าของคนเดิม
-            if vc.channel.id != target_channel.id:
-                try:
-                    await vc.move_to(target_channel)
-                    state.channel_id = target_channel.id
-                except Exception as e:
-                    return False, f"❌ ไม่สามารถย้ายตามไปยังห้องเสียงได้: {e}"
 
-        # รีเซ็ตเวลา Idle 15 นาทีทุกครั้งที่เจ้าของสั่งงาน
+        # รีเซ็ตเวลา Idle 15 นาทีของห้องทุกครั้งที่มีคนในห้องสั่งงาน
         await start_or_reset_idle_timer(guild, state)
 
         # เริ่มตัวเล่นเสียงหากยังไม่ได้รัน
         if state.player_task is None or state.player_task.done():
             state.player_task = asyncio.create_task(audio_player_worker(guild, state))
 
-        await state.queue.put(text)
-        print(f"[TTS] Guild={guild.name} User={user} Text={text}", flush=True)
-        return True, f"🔊 กำลังพูด: **{text}**"
+        pending_count = state.queue.qsize() + (1 if state.is_speaking or (vc and vc.is_playing()) else 0)
+        item = QueueItem(user_id=user.id, user_name=user.display_name, text=text)
+        await state.queue.put(item)
+
+        print(f"[TTS] Guild={guild.name} Channel={target_channel.name} User={user} QueuePos={pending_count} Text={text}", flush=True)
+
+        if pending_count > 0:
+            return True, f"⏳ เข้าคิวลำดับที่ **#{pending_count}** ({user.display_name}): **{text}**"
+        return True, f"🔊 กำลังพูด ({user.display_name}): **{text}**"
 
 
 @bot.event
 async def on_ready():
     print(f"✅ บอทออนไลน์แล้วในชื่อ: {bot.user} (ID: {bot.user.id})", flush=True)
     print(f"📌 Prefix: {COMMAND_PREFIX}say <ข้อความ> หรือ /say <ข้อความ>", flush=True)
-    print(f"⏱️ ตั้งค่า Idle Timeout: {IDLE_TIMEOUT} วินาที ({IDLE_TIMEOUT / 60:.1f} นาที)", flush=True)
+    print(f"⏱️ ตั้งค่า Idle Timeout รายห้อง: {IDLE_TIMEOUT} วินาที ({IDLE_TIMEOUT / 60:.1f} นาที)", flush=True)
     print(f"🌐 เซิร์ฟเวอร์ที่บอทอยู่ตอนนี้: {[g.name for g in bot.guilds]}", flush=True)
     # ล้างสถานะค้างในห้องเสียงกรณีเพิ่งรีสตาร์ทบอทใหม่
     for guild in bot.guilds:
@@ -332,12 +337,18 @@ async def on_voice_state_update(
     before: discord.VoiceState,
     after: discord.VoiceState,
 ):
-    """ตรวจจับเมื่อบอทถูกเตะออกจากห้อง (Disconnect) เพื่อปลดล็อก 1:1 ทันที"""
+    """
+    ตรวจจับเมื่อบอทถูกเตะออกจากห้อง (Disconnect) หรือถูกแอดมินย้ายห้อง
+    เพื่อปลดล็อกหรืออัปเดตห้องทันที
+    """
     if bot.user and member.id == bot.user.id:
+        state = bot.get_state(member.guild.id)
         if before.channel is not None and after.channel is None:
-            state = bot.get_state(member.guild.id)
             state.reset_state()
-            print(f"🔓 บอทถูกตัดการเชื่อมต่อจากห้องเสียงในเซิร์ฟเวอร์ {member.guild.name} — ปลดล็อกสถานะ 1:1 แล้ว", flush=True)
+            print(f"🔓 บอทถูกตัดการเชื่อมต่อจากห้องเสียงในเซิร์ฟเวอร์ {member.guild.name} — ปลดล็อกห้องและล้างคิวแล้ว", flush=True)
+        elif after.channel is not None and before.channel != after.channel:
+            state.channel_id = after.channel.id
+            print(f"🔀 บอทถูกย้ายไปยังห้อง {after.channel.name} ในเซิร์ฟเวอร์ {member.guild.name}", flush=True)
 
 
 # ==================== คำสั่งแบบ Prefix (!say) ====================
@@ -351,7 +362,7 @@ async def say_prefix(ctx: commands.Context, *, text: str = ""):
 
 
 # ==================== คำสั่งแบบ Slash (/say) ====================
-@bot.tree.command(name="say", description="ให้บอทพูดตามข้อความที่พิมพ์ (เสียงอ่านโดเนท TipMe แบบล็อก 1:1)")
+@bot.tree.command(name="say", description="ให้บอทพูดตามข้อความที่พิมพ์ (ระบบคิวข้อความ ล็อกเฉพาะรายห้องเสียง)")
 @app_commands.describe(text="ข้อความที่ต้องการให้บอทพูด")
 async def say_slash(interaction: discord.Interaction, text: str):
     if not interaction.guild or not isinstance(interaction.user, discord.Member):
